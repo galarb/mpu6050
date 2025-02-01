@@ -1,0 +1,360 @@
+# Class to read data from the (GY-521) MPU6050 Accelerometer/Gyro Module
+# Ported to MicroPython by Warayut Poomiwatracanont JAN 2023
+# Original repo https://github.com/nickcoutsos/MPU-6050-Python
+# and https://github.com/CoreElectronics/CE-PiicoDev-MPU6050-MicroPython-Module
+#edited by Gal to include reliable calibration and angle methods
+
+from math import sqrt, atan2
+from machine import Pin, SoftI2C
+from time import ticks_ms, ticks_diff, sleep_ms, ticks_us
+
+
+error_msg = "\nError \n"
+i2c_err_str = "ESP32 could not communicate with module at address 0x{:02X}, check wiring"
+
+# Global Variables
+_GRAVITIY_MS2 = 9.80665
+
+# Scale Modifiers
+_ACC_SCLR_2G = 16384.0
+_ACC_SCLR_4G = 8192.0
+_ACC_SCLR_8G = 4096.0
+_ACC_SCLR_16G = 2048.0
+
+_GYR_SCLR_250DEG = 131.0
+_GYR_SCLR_500DEG = 65.5
+_GYR_SCLR_1000DEG = 32.8
+_GYR_SCLR_2000DEG = 16.4
+
+# Pre-defined ranges
+_ACC_RNG_2G = 0x00
+_ACC_RNG_4G = 0x08
+_ACC_RNG_8G = 0x10
+_ACC_RNG_16G = 0x18
+
+_GYR_RNG_250DEG = 0x00
+_GYR_RNG_500DEG = 0x08
+_GYR_RNG_1000DEG = 0x10
+_GYR_RNG_2000DEG = 0x18
+
+# MPU-6050 Registers
+_PWR_MGMT_1 = 0x6B
+
+_ACCEL_XOUT0 = 0x3B
+
+_TEMP_OUT0 = 0x41
+
+_GYRO_XOUT0 = 0x43
+
+_ACCEL_CONFIG = 0x1C
+_GYRO_CONFIG = 0x1B
+
+_maxFails = 3
+
+# Address
+_MPU6050_ADDRESS = 0x68
+
+def signedIntFromBytes(x, endian="big"):
+    y = int.from_bytes(x, endian)
+    if (y >= 0x8000):
+        return -((65535 - y) + 1)
+    else:
+        return y
+    
+
+class MPU6050(object):     
+    def __init__(self, bus=None, freq=None, sda=None, scl=None, addr=_MPU6050_ADDRESS):
+        # Checks any erorr would happen with I2C communication protocol.
+        self._failCount = 0
+        self._terminatingFailCount = 0
+        
+        # Initializing the I2C method for ESP32
+        # Pin assignment:
+        # SCL -> GPIO 22
+        # SDA -> GPIO 21
+        self.i2c = SoftI2C(scl=Pin(16), sda=Pin(17), freq=100000)
+        
+        # Initializing the I2C method for ESP8266
+        # Pin assignment:
+        # SCL -> GPIO 5
+        # SDA -> GPIO 4
+        # self.i2c = I2C(scl=Pin(5), sda=Pin(4))
+        
+        self.addr = addr
+        try:
+            # Wake up the MPU-6050 since it starts in sleep mode
+            self.i2c.writeto_mem(self.addr, _PWR_MGMT_1, bytes([0x00]))
+            sleep_ms(5)
+        except Exception as e:
+            print(i2c_err_str.format(self.addr))
+            print(error_msg)
+            raise e
+        self._accel_range = self.get_accel_range(True)
+        self._gyro_range = self.get_gyro_range(True)
+        
+        # Initialize angle variables
+        self.angle_x = 0
+        self.angle_y = 0
+        self.angle_z = 0
+
+        # Initialize bias variables
+        self.bias_x = 0
+        self.bias_y = 0
+        self.bias_z = 0
+        self.biasaccel_x = 0
+        self.biasaccel_y = 0
+        self.biasaccel_z = 0
+
+        self.last_time = ticks_us()  # Initialize time
+
+        self.iteration_counter = 0  # Counter to track iterations
+
+        self.calibrate_gyro()  # Perform calibration at startup
+        
+
+    def _readData(self, register):
+        failCount = 0
+        while failCount < _maxFails:
+            try:
+                sleep_ms(10)
+                data = self.i2c.readfrom_mem(self.addr, register, 6)
+                break
+            except:
+                failCount = failCount + 1
+                self._failCount = self._failCount + 1
+                if failCount >= _maxFails:
+                    self._terminatingFailCount = self._terminatingFailCount + 1
+                    print(i2c_err_str.format(self.addr))
+                    return {"x": float("NaN"), "y": float("NaN"), "z": float("NaN")} 
+        x = signedIntFromBytes(data[0:2])
+        y = signedIntFromBytes(data[2:4])
+        z = signedIntFromBytes(data[4:6])
+        return {"x": x, "y": y, "z": z}
+
+    # Reads the temperature from the onboard temperature sensor of the MPU-6050.
+    # Returns the temperature [degC].
+    def read_temperature(self):
+        try:
+            rawData = self.i2c.readfrom_mem(self.addr, _TEMP_OUT0, 2)
+            raw_temp = (signedIntFromBytes(rawData, "big"))
+        except:
+            print(i2c_err_str.format(self.addr))
+            return float("NaN")
+        actual_temp = (raw_temp / 340) + 36.53
+        return actual_temp
+
+    # Sets the range of the accelerometer
+    # accel_range : the range to set the accelerometer to. Using a pre-defined range is advised.
+    def set_accel_range(self, accel_range):
+        self.i2c.writeto_mem(self.addr, _ACCEL_CONFIG, bytes([accel_range]))
+        self._accel_range = accel_range
+
+    # Gets the range the accelerometer is set to.
+    # raw=True: Returns raw value from the ACCEL_CONFIG register
+    # raw=False: Return integer: -1, 2, 4, 8 or 16. When it returns -1 something went wrong.
+    def get_accel_range(self, raw = False):
+        # Get the raw value
+        raw_data = self.i2c.readfrom_mem(self.addr, _ACCEL_CONFIG, 2)
+        
+        if raw is True:
+            return raw_data[0]
+        elif raw is False:
+            if raw_data[0] == _ACC_RNG_2G:
+                return 2
+            elif raw_data[0] == _ACC_RNG_4G:
+                return 4
+            elif raw_data[0] == _ACC_RNG_8G:
+                return 8
+            elif raw_data[0] == _ACC_RNG_16G:
+                return 16
+            else:
+                return -1
+
+    # Reads and returns the AcX, AcY and AcZ values from the accelerometer.
+    # Returns dictionary data in g or m/s^2 (g=False)
+    def read_accel_data(self, g = False):         
+        accel_data = self._readData(_ACCEL_XOUT0)
+        accel_range = self._accel_range
+        scaler = None
+        if accel_range == _ACC_RNG_2G:
+            scaler = _ACC_SCLR_2G
+        elif accel_range == _ACC_RNG_4G:
+            scaler = _ACC_SCLR_4G
+        elif accel_range == _ACC_RNG_8G:
+            scaler = _ACC_SCLR_8G
+        elif accel_range == _ACC_RNG_16G:
+            scaler = _ACC_SCLR_16G
+        else:
+            print("Unkown range - scaler set to _ACC_SCLR_2G")
+            scaler = _ACC_SCLR_2G
+
+        x = accel_data["x"] / scaler
+        y = accel_data["y"] / scaler
+        z = accel_data["z"] / scaler
+
+        if g is True:
+            return {"x": x, "y": y, "z": z}
+        elif g is False:
+            x = x * _GRAVITIY_MS2
+            y = y * _GRAVITIY_MS2
+            z = z * _GRAVITIY_MS2
+            return {"x": x, "y": y, "z": z}
+
+    def read_accel_abs(self, g=False):
+        d=self.read_accel_data(g)
+        return sqrt(d["x"]**2+d["y"]**2+d["z"]**2)
+
+    def set_gyro_range(self, gyro_range):
+        self.i2c.writeto_mem(self.addr, _GYRO_CONFIG, bytes([gyro_range]))
+        self._gyro_range = gyro_range
+
+    # Gets the range the gyroscope is set to.
+    # raw=True: return raw value from GYRO_CONFIG register
+    # raw=False: return range in deg/s
+    def get_gyro_range(self, raw = False):
+        # Get the raw value
+        raw_data = self.i2c.readfrom_mem(self.addr, _GYRO_CONFIG, 2)
+
+        if raw is True:
+            return raw_data[0]
+        elif raw is False:
+            if raw_data[0] == _GYR_RNG_250DEG:
+                return 250
+            elif raw_data[0] == _GYR_RNG_500DEG:
+                return 500
+            elif raw_data[0] == _GYR_RNG_1000DEG:
+                return 1000
+            elif raw_data[0] == _GYR_RNG_2000DEG:
+                return 2000
+            else:
+                return -1
+
+    # Gets and returns the GyX, GyY and GyZ values from the gyroscope.
+    # Returns the read values in a dictionary.
+    def read_gyro_data(self):
+        gyro_data = self._readData(_GYRO_XOUT0)
+        gyro_range = self._gyro_range
+        scaler = None
+        if gyro_range == _GYR_RNG_250DEG:
+            scaler = _GYR_SCLR_250DEG
+        elif gyro_range == _GYR_RNG_500DEG:
+            scaler = _GYR_SCLR_500DEG
+        elif gyro_range == _GYR_RNG_1000DEG:
+            scaler = _GYR_SCLR_1000DEG
+        elif gyro_range == _GYR_RNG_2000DEG:
+            scaler = _GYR_SCLR_2000DEG
+        else:
+            print("Unkown range - scaler set to _GYR_SCLR_250DEG")
+            scaler = _GYR_SCLR_250DEG
+
+        x = gyro_data["x"] / scaler
+        y = gyro_data["y"] / scaler
+        z = gyro_data["z"] / scaler
+
+        return {"x": x, "y": y, "z": z}
+
+    def read_angle(self): # returns radians. orientation matches silkscreen
+        a=self.read_accel_data()
+        x=atan2(a["y"],a["z"])
+        y=atan2(-a["x"],a["z"])
+        return {"x": x, "y": y}
+
+    def calcangle(self):
+        # Accelerometer Data
+        accel = self.read_accel_data()  # Read the accelerometer [m/s^2]
+        aX = accel["x"]
+        aY = accel["y"]
+        aZ = accel["z"]
+        # print(f"x: {aX}, y: {aY}, z: {aZ}")
+
+        # Gyroscope Data
+        gyro = self.read_gyro_data()   # Read the gyro [deg/s]
+        gX = gyro["x"]
+        gY = gyro["y"]
+        gZ = gyro["z"]
+        # print(f"x: {gX}, y: {gY}, z: {gZ}")
+
+        # Rough Temperature
+        temp = self.read_temperature()   # Read the device temperature [°C]
+        # print(f"Temperature: {temp}°C")
+
+        return {"accel": accel, "gyro": gyro, "temperature": temp}
+    
+    def update_angle(self):
+        # Increment counter
+        self.iteration_counter += 1
+
+        # Get current time
+        current_time = ticks_us()
+        dt = ticks_diff(current_time, self.last_time) / 1000000.0  # Convert to seconds
+        self.last_time = current_time
+
+        # Read gyroscope data (angular velocities)
+        gyro_data = self.read_gyro_data()
+        angular_velocity_x = gyro_data["x"] - self.bias_x
+        angular_velocity_y = gyro_data["y"] - self.bias_y
+        angular_velocity_z = gyro_data["z"] - self.bias_z
+
+        # Read accelerometer data for angular acceleration
+        accel = self.read_accel_data()
+        angular_acceleration_x = accel["x"] - self.biasaccel_x
+        angular_acceleration_y = accel["y"] - self.biasaccel_y
+        angular_acceleration_z = accel["z"] - self.biasaccel_z
+
+        # First integration: Angular velocity -> Angle
+        self.angle_x += angular_velocity_x * dt
+        self.angle_y += angular_velocity_y * dt
+        self.angle_z += angular_velocity_z * dt
+
+        # Second integration: Angular acceleration -> Refined Angle
+        self.angle_x += 0.5 * angular_acceleration_x * dt ** 2
+        self.angle_y += 0.5 * angular_acceleration_y * dt ** 2
+        self.angle_z += 0.5 * angular_acceleration_z * dt ** 2
+
+        # Print only every 10th iteration to reduce impact on timing
+        if self.iteration_counter % 10 == 0:
+            print(f"Angles - Roll (X): {self.angle_x:.2f}, Pitch (Y): {self.angle_y:.2f}, Yaw (Z): {self.angle_z:.2f}")
+
+        return self.angle_x, self.angle_y, self.angle_z
+
+
+   
+
+    def calibrate_gyro(self):
+        print("Calibrating gyroscope...")
+        num_samples = 100
+
+        # Initialize bias accumulators
+        total_bias_x = 0
+        total_bias_y = 0
+        total_bias_z = 0
+        total_accbiasx = 0
+        total_accbiasy = 0
+        total_accbiasz = 0
+
+        for _ in range(num_samples):
+            gyro_data = self.read_gyro_data()
+            total_bias_x += gyro_data["x"]
+            total_bias_y += gyro_data["y"]
+            total_bias_z += gyro_data["z"]
+
+            # Read accelerometer data
+            accel = self.read_accel_data()  # Ensure this function exists
+            total_accbiasx += accel["x"]
+            total_accbiasy += accel["y"]
+            total_accbiasz += accel["z"]
+            
+            sleep_ms(1)  # Small delay between samples
+
+        # Store the calculated bias
+        self.bias_x = total_bias_x / num_samples
+        self.bias_y = total_bias_y / num_samples
+        self.bias_z = total_bias_z / num_samples
+        self.biasaccel_x = total_accbiasx / num_samples
+        self.biasaccel_y = total_accbiasy / num_samples
+        self.biasaccel_z = total_accbiasz / num_samples
+
+        print(f"Calibration complete. Gyro Bias - X: {self.bias_x}, Y: {self.bias_y}, Z: {self.bias_z}")
+        print(f"Calibration complete. Accel Bias - X: {self.biasaccel_x}, Y: {self.biasaccel_y}, Z: {self.biasaccel_z}")
+
+
